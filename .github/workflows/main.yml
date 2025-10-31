@@ -1,0 +1,217 @@
+---
+# ============================================================================
+# Container Security Scan - コンテナセキュリティスキャン
+# ============================================================================
+#
+# 【概要】
+# DockerコンテナイメージとDockerfileをスキャンし、脆弱性やベストプラクティス違反を検出します。
+# TrivyとHadolintの2つのツールで効率的にセキュリティチェックを実施します。
+#
+# 【目的】
+# - コンテナイメージ内の脆弱性（CVE）を早期発見
+# - Dockerfileのセキュリティベストプラクティス遵守を確認
+# - 本番環境へのデプロイ前にリスクを低減
+#
+# 【検出対象】
+# - OSパッケージの脆弱性（apt、yum、apkなど）
+# - アプリケーション依存関係の脆弱性（npm、pip、Maven、Goなど）
+# - Dockerfileのセキュリティ問題
+# - コンテナ設定の問題（rootユーザー実行、過剰な権限など）
+#
+# 【使用ツール】
+# - Trivy: コンテナイメージの脆弱性スキャン（AquaSecurity製）
+# - Hadolint: Dockerfileのベストプラクティスチェック
+#
+# 【必要な依存関係】
+# - GitHub Advanced Security（SARIF結果のアップロード用）
+#   ※パブリックリポジトリは無料、プライベートは有料
+# - Docker Buildx（イメージビルド用）
+# - 特別な設定やシークレットは不要
+#
+# 【実行タイミング】
+# - Dockerfileやdocker-compose.ymlの変更時のみ実行（効率化のため）
+# - mainまたはdevelopブランチへのプッシュ時
+# - mainまたはdevelopブランチへのプルリクエスト作成時
+# - 手動実行（workflow_dispatch）- 任意のイメージをスキャン可能
+#
+# ============================================================================
+
+name: Container Security Scan
+
+on:
+  push:
+    branches: [main, develop]
+    paths: ["**/Dockerfile", "**/Dockerfile.*", docker-compose*.yml]
+  pull_request:
+    branches: [main, develop]
+    paths: ["**/Dockerfile", "**/Dockerfile.*", docker-compose*.yml]
+  workflow_dispatch:
+    inputs:
+      image:
+        description: 'Docker image to scan (e.g., nginx:latest)'
+        required: false
+        type: string
+
+jobs:
+  # ==========================================================================
+  # Trivy - コンテナイメージの脆弱性スキャン
+  # ==========================================================================
+  # 【機能】
+  # - ビルド済みコンテナイメージの脆弱性スキャン
+  # - OSパッケージとアプリケーション依存関係の両方を検出
+  # - レイヤーごとの脆弱性分析
+  # - 設定ファイル（Dockerfile、K8sマニフェストなど）のチェック
+  # - AquaSecurityが開発・メンテナンス
+  #
+  # 【検出内容】
+  # - ベースイメージの脆弱性
+  # - インストールされたパッケージの脆弱性（apt、yum、apkなど）
+  # - アプリケーションライブラリの脆弱性
+  #   - Python (pip、Pipfile、poetry)
+  #   - JavaScript/TypeScript (npm、yarn、pnpm)
+  #   - Java (Maven、Gradle)
+  #   - Go (go.mod)
+  #   - Ruby (Gemfile)
+  #   - Rust (Cargo.lock)
+  # - 古いイメージの使用
+  # - 設定ミス（rootユーザー、privilegedモードなど）
+  #
+  # 【特徴】
+  # - 高速スキャン
+  # - 複数の脆弱性データベースを使用（NVD、Red Hat、Debian、Alpine等）
+  # - SARIF形式での出力でGitHub Securityタブに統合
+  # - オフライン動作可能
+  # ==========================================================================
+  trivy:
+    name: Trivy Container Scan
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write # SARIF結果をアップロードするために必要
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Docker Buildxのセットアップ（マルチプラットフォームビルド対応）
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Dockerイメージをビルド
+      # - リポジトリ内のDockerfileを検索してビルド
+      # - または、手動実行時に指定されたイメージを使用
+      - name: Build Docker image
+        id: build
+        run: |
+          # 手動実行で外部イメージが指定された場合
+          if [ -n "${{ inputs.image }}" ]; then
+            echo "image=${{ inputs.image }}" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Dockerfileを検索
+          DOCKERFILE=$(find . -name "Dockerfile" -not -path "*/\.*" | head -n 1)
+          if [ -n "$DOCKERFILE" ]; then
+            IMAGE_NAME="local-image:${{ github.sha }}"
+            docker build -t $IMAGE_NAME -f $DOCKERFILE .
+            echo "image=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          else
+            echo "No Dockerfile found and no image specified"
+            exit 0
+          fi
+
+      # Trivyイメージスキャンを実行
+      # image-ref: スキャン対象のイメージ名
+      # severity: 検出する深刻度（CRITICAL, HIGH, MEDIUM）
+      - name: Run Trivy vulnerability scanner
+        if: steps.build.outputs.image != ''
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ steps.build.outputs.image }}
+          format: sarif
+          output: trivy.sarif
+          severity: CRITICAL,HIGH,MEDIUM
+
+      # SARIF結果をGitHub Security タブにアップロード
+      # 注意: GitHub Advanced Security が必要（パブリック: 無料、プライベート: 有料）
+      - name: Upload SARIF file
+        if: steps.build.outputs.image != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy.sarif
+        continue-on-error: true
+
+  # ==========================================================================
+  # Hadolint - Dockerfileリンター
+  # ==========================================================================
+  # 【機能】
+  # - Dockerfileのベストプラクティスチェック
+  # - セキュリティ問題の検出
+  # - ビルド最適化の提案
+  #
+  # 【検出内容】
+  # - レイヤー数の最適化不足（RUNコマンドの統合不足）
+  # - キャッシュの非効率な使用
+  # - 不要なパッケージのインストール
+  # - rootユーザーの使用
+  # - 最新タグ（:latest）の使用
+  # - HEALTHCHECKの欠如
+  # - セキュアでないプロトコル（HTTP）の使用
+  # - パッケージマネージャーのキャッシュクリア不足
+  #
+  # 【検出例】
+  # - DL3008: apt-get install に --no-install-recommends がない
+  # - DL3009: apt-get後にキャッシュ削除がない
+  # - DL3020: COPY --from の使用にビルドステージ名がない
+  # - DL3025: CMD/ENTRYPOINTにJSON形式を使用すべき
+  #
+  # 【特徴】
+  # - ShellCheckを統合（Dockerfile内のシェルスクリプトもチェック）
+  # - カスタムルールの追加が可能
+  # - CI/CD統合が容易
+  # - SARIF形式での出力でGitHub Securityタブに統合
+  # ==========================================================================
+  hadolint:
+    name: Hadolint Dockerfile Linter
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # Dockerfileを検索
+      - name: Find Dockerfile
+        id: find_dockerfile
+        run: |
+          DOCKERFILE=$(find . -name "Dockerfile" -not -path "*/\.*" | head -n 1)
+          if [ -n "$DOCKERFILE" ]; then
+            echo "dockerfile=$DOCKERFILE" >> $GITHUB_OUTPUT
+          else
+            echo "No Dockerfile found"
+            exit 0
+          fi
+
+      # Hadolintを実行
+      # Dockerfileのベストプラクティスとセキュリティをチェック
+      # no-fail: true により、問題が見つかってもワークフローを失敗させない
+      - name: Run Hadolint
+        if: steps.find_dockerfile.outputs.dockerfile != ''
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ steps.find_dockerfile.outputs.dockerfile }}
+          format: sarif
+          output-file: hadolint.sarif
+          no-fail: true
+        continue-on-error: true
+
+      # SARIF結果をGitHub Security タブにアップロード
+      # 注意: GitHub Advanced Security が必要（パブリック: 無料、プライベート: 有料）
+      - name: Upload SARIF file
+        if: steps.find_dockerfile.outputs.dockerfile != '' && hashFiles('hadolint.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: hadolint.sarif
+        continue-on-error: true
